@@ -1,0 +1,3 @@
+# Optional: editable OPJU generation through an installed Origin application.
+# The package version must be compatible with the local Origin installation.
+originpro>=1.1.14

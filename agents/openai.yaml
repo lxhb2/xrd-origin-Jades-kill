@@ -1,0 +1,4 @@
+interface:
+  display_name: "XRD 堆叠图与 PDF 卡片"
+  short_description: "Jade 物相检索与 Origin XRD 堆叠图配图流程"
+  default_prompt: "用 $xrd-origin-jade 处理 XRD 数据前，先向我要目标元素和化学式；如果我没有，就根据样品信息或研究方向查资料后归纳。确认后再用 Jade 检索候选卡片，并生成上方 XRD、下方按卡片逐层排列棒状图的 Origin 可编辑图；单谱按需要支持符号标峰或 hkl 晶面指数标峰，启用标峰时不再显示下方 PDF 卡片棒状图。"
