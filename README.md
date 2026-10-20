@@ -8,7 +8,7 @@
 ## 功能
 
 - 用 `scripts/jade_phaseid.py` 驱动 Jade 6.5：寻峰、元素/化学式筛选、Search/Match、候选结果导出和 PDF 卡片导出。
-- 用 `scripts/xrd_stack.py` 解析样品谱与 Jade 卡片：生成 XRD 堆叠图、下方分层 PDF 棒状图、Origin 可导入数据表。
+- 用 `scripts/xrd_stack.py` 解析样品谱与 Jade 卡片：生成 XRD 堆叠图、下方分层 PDF 棒状图、Origin 可导入数据表。默认使用 11 点/3 阶 Savitzky–Golay 显示平滑，仅改图不改原始强度表。
 - 单谱支持 `markers` 符号标峰和 `hkl` 晶面指数标峰；启用标峰时不再绘制 PDF 卡片棒状图。
 - 用 `scripts/origin_stack.py` 调用本机 Origin，生成可继续编辑的 `OPJU + PNG + PDF`。
 - `references/` 和 `assets/` 提供 Jade 操作、Origin 画法、科学判据、质检清单和示例图。
@@ -61,6 +61,9 @@ python scripts/xrd_stack.py `
   --card "Si=jade\Si_75-0589.txt" `
   --card "FeS2=jade\FeS2_71-1680.txt" `
   --out .\figs\single `
+  --smooth savgol --smooth-window 11 --smooth-polyorder 3 `
+  --card-row-height 0.40 --stick-height 0.58 --card-min-intensity 5 `
+  --font "Times New Roman" `
   --peak-marking markers `
   --marker-min-intensity 5
 ```
@@ -76,12 +79,21 @@ python scripts/xrd_stack.py `
   --out .\figs\stack
 ```
 
-Jade 检索前必须先取得目标元素和化学式。示例：
+元素未知时先做不限定元素的 Search/Match，结果只作为候选池：
 
 ```powershell
 python scripts/jade_phaseid.py search `
   --pattern "raw\sample.raw" `
   --out .\jade_out `
+  --unfiltered
+```
+
+取得 XRF/EDS、原料信息或文献证据后，再做限定元素检索。示例：
+
+```powershell
+python scripts/jade_phaseid.py search `
+  --pattern "raw\sample.raw" `
+  --out .\jade_out_filtered `
   --elements "Si,Fe,Cu,S" `
   --formula "Si + FeS2 + CuFeS2" `
   --filter-mode possible `
@@ -122,8 +134,8 @@ python scripts/origin_stack.py `
 
 - `VERSION` 保存当前打包版本号。
 - `CHANGELOG.md` 记录版本变化。
-- Git 标签使用 `v主版本.次版本.修订号`，当前标签为 `v1.2.2`。
-- 脚本内部版本：`jade_phaseid.py v2.2.0`、`xrd_stack.py v1.2.2`、`origin_stack.py v1.2.2`。
+- Git 标签使用 `v主版本.次版本.修订号`，当前标签为 `v1.3.0`。
+- 脚本内部版本：`jade_phaseid.py v2.2.1`、`xrd_stack.py v1.3.0`、`origin_stack.py v1.3.0`。
 
 ## 科学边界
 

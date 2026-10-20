@@ -23,7 +23,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 DEFAULT_JADE_EXE = Path(
     r"D:\百度网盘下载\XRD数据软件MDI Jade 6.5\MDI Jade 6.5\jade6.5.exe"
@@ -41,9 +41,12 @@ SEARCH_TASKS = [
 
 PDF_NUMBER_RE = re.compile(r"(?P<num>\d{2,3}-\d{4,5})")
 PDF_NUMBER_FULL_RE = re.compile(r"^\s*\d{2,3}-\d{4,5}\s*$")
-CARD_MARKER_RE = re.compile(r"(?P<marker>P[0-9A-Z]{6})(?P<line>HI|X6|H6|X7|H7|H[0-9A-F])\s*$")
+CARD_MARKER_RE = re.compile(
+    r"(?P<marker>[PAR][0-9A-Z]{6})"
+    r"(?P<line>[A-Z][0-9A-Z])\s*$"
+)
 COMPACT_CARD_MARKER_RE = re.compile(
-    r"(?P<marker>P[0-9A-Z]{6}(?:T|C|H|X|A)[0-9A-Z])\s*$"
+    r"(?P<marker>[PAR][0-9A-Z]{6}[A-Z][0-9A-Z])\s*$"
 )
 
 # Element buttons in the classic Jade 6.5 "Current Chemistry" dialog are
@@ -285,8 +288,15 @@ def _find_window(pid: int, title_contains: str, class_name: str | None = None):
 
 def _uia_root(pid: int):
     desktop = _gui_modules()["Desktop"]
-    for window in desktop(backend="uia").windows(process=pid, visible_only=False):
+    windows = desktop(backend="uia").windows(process=pid, visible_only=False)
+    for window in windows:
         if _title(window).startswith("Jade 6 ["):
+            return window
+    for window in windows:
+        if (
+            getattr(window.element_info, "control_type", "") == "Pane"
+            and _title(window) == "MDI Jade 6.5"
+        ):
             return window
     raise RuntimeError("UIAutomation 找不到 Jade 主窗口。")
 
@@ -529,8 +539,12 @@ def _find_data_window(pid: int):
     matches = []
     for window in _windows(pid):
         title = _title(window)
-        if window.class_name() == "ThunderRT5Form" and title.startswith("Jade 6 ["):
-            matches.append(window)
+        try:
+            if window.class_name() == "ThunderRT5Form" and title.startswith("Jade 6 ["):
+                matches.append(window)
+        except Exception:
+            # Jade briefly exposes invalid HWND wrappers while starting.
+            continue
     for window in matches:
         try:
             if window.is_visible():
@@ -544,10 +558,13 @@ def _find_jade_pid():
     desktop = _gui_modules()["Desktop"]
     for window in desktop(backend="win32").windows(visible_only=False):
         title = _title(window)
-        if window.class_name() == "ThunderRT5Main" and title == "MDI Jade 6.5":
-            return window.process_id()
-        if window.class_name() == "ThunderRT5Form" and title.startswith("Jade 6 ["):
-            return window.process_id()
+        try:
+            if window.class_name() == "ThunderRT5Main" and title == "MDI Jade 6.5":
+                return window.process_id()
+            if window.class_name() == "ThunderRT5Form" and title.startswith("Jade 6 ["):
+                return window.process_id()
+        except Exception:
+            continue
     return None
 
 
@@ -656,6 +673,17 @@ def _reset_workflow_windows(pid: int) -> None:
         "PDF#",
     ):
         _close_matching(pid, title)
+    for window in _windows(pid):
+        try:
+            if (
+                window.is_visible()
+                and window.class_name() == "ThunderRT5Form"
+                and not _title(window).strip()
+            ):
+                _post_close(window)
+        except Exception:
+            continue
+    time.sleep(0.3)
 
 
 def _load_pattern(main: Any, pattern: Path, timeout: float) -> Any:
@@ -955,8 +983,8 @@ def _set_chemistry_filter(
 ) -> None:
     if not elements:
         raise SystemExit(
-            "Jade 检索前必须提供元素和化学式。请先询问用户；"
-            "如果用户没有，再获取样品信息或研究方向后归纳常规元素和化学式。"
+            "限定元素检索需要 elements。元素未知时请在 search 命令加 "
+            "--unfiltered，先做无条件 Search/Match。"
         )
     unsupported = [symbol for symbol in elements if symbol not in ELEMENT_BUTTONS]
     if unsupported:
@@ -1091,7 +1119,12 @@ def _run_find_peaks(pid: int, main: Any, timeout: float) -> None:
     time.sleep(0.3)
 
 
-def _run_search_match(pid: int, main: Any, timeout: float) -> None:
+def _run_search_match(
+    pid: int,
+    main: Any,
+    timeout: float,
+    use_chemistry_filter: bool = True,
+) -> None:
     _reset_workflow_windows(pid)
     time.sleep(0.3)
     _send_menu_command(main, 147)  # Identify -> Search/Match Setup...
@@ -1132,7 +1165,7 @@ def _run_search_match(pid: int, main: Any, timeout: float) -> None:
             break
     if item is None:
         raise RuntimeError("Search/Match Setup 里没有找到 Use Chemistry Filter。")
-    _set_list_item_checked(setup, item, True)
+    _set_list_item_checked(setup, item, use_chemistry_filter)
     _invoke_uia_button(setup, 7, "OK")
     if not _wait_for(lambda: _find_window(pid, "Search/Match Display"), timeout):
         _dismiss_error_windows(pid)
@@ -1320,38 +1353,63 @@ def _child_handles(root_handle: int, class_name: str) -> list[int]:
 
 
 def _find_retrieval_edit(window: Any):
-    edits = []
-    for child in window.descendants():
-        if child.class_name() != "Edit":
-            continue
-        text = _title(child).strip()
-        rect = child.rectangle()
-        if 150 < rect.top < 260:
-            edits.append((child, text))
-
-    # On a clean window the card selector is the second combo box in the
-    # filter row: subset database | card browser | chemistry filter.
-    combos = [
+    controls = list(window.descendants())
+    edits = [
         child
-        for child in window.descendants()
-        if child.class_name() == "ThunderRT5ComboBox"
-        and 150 < child.rectangle().top < 260
+        for child in controls
+        if child.class_name() == "Edit"
         and child.is_visible()
     ]
-    combos.sort(key=lambda child: child.rectangle().left)
-    if len(combos) >= 2:
-        card_combo = combos[1]
-        for child, _ in edits:
-            if card_combo.rectangle().left <= child.rectangle().left <= card_combo.rectangle().right:
+    combos = [
+        child
+        for child in controls
+        if child.class_name() == "ThunderRT5ComboBox"
+        and child.is_visible()
+    ]
+
+    def contains(combo: Any, control: Any) -> bool:
+        outer = combo.rectangle()
+        inner = control.rectangle()
+        return (
+            outer.left - 3 <= inner.left <= outer.right + 3
+            and outer.top - 3 <= inner.top <= outer.bottom + 3
+        )
+
+    # The card selector is a ThunderRT5ComboBox whose inner edit is often not
+    # returned by a position-filtered descendant search. First trust a combo
+    # that already contains a card-looking value; otherwise use the second
+    # visible combo in the filter row.
+    card_like_combos = [
+        combo for combo in combos if PDF_NUMBER_RE.search(_title(combo))
+    ]
+    ordered_combos = sorted(
+        combos,
+        key=lambda combo: (combo.rectangle().top, combo.rectangle().left),
+    )
+    candidates = card_like_combos or (
+        [ordered_combos[1]] if len(ordered_combos) >= 2 else ordered_combos
+    )
+    for combo in candidates:
+        try:
+            combo_children = list(combo.children())
+        except Exception:
+            combo_children = []
+        for child in combo_children:
+            if child.class_name() == "Edit":
+                return child
+        for child in edits:
+            if contains(combo, child):
                 return child
 
-    # Fall back to an edit that already contains a card-looking value.
-    for child, text in edits:
-        if PDF_NUMBER_RE.search(text):
-            return child
+    # A closed third-party combo can expose its value only on the combo itself.
+    if candidates:
+        return candidates[0]
 
-    if edits:
-        return edits[0][0]
+    for child in edits:
+        if PDF_NUMBER_RE.search(_title(child)):
+            return child
+    if len(edits) == 1:
+        return edits[0]
     raise RuntimeError("PDF 检索窗口里没有找到卡片号输入框。")
 
 
@@ -1417,21 +1475,13 @@ def _open_card_window(pid: int, retrieval: Any, pdf_number: str, timeout: float)
     except Exception:
         pass
 
-    # The report-view item rectangles from this Jade ListView are offset by
-    # roughly one row relative to its hit-test coordinates. Clicking the
-    # rectangle's vertical centre therefore opens the previous card. Probe a
-    # few coordinates around the requested row and accept only the matching
-    # PDF# window.
+    # Jade's report-view rectangles are not the hit-test coordinates used by
+    # double_click_input. Calibrate the vertical mapping with single clicks
+    # (which only change selection), then double-click the calibrated target.
     rect = result_list.get_item_rect(target_index)
     client = result_list.client_rect()
     row_height = max(1, rect.bottom - rect.top)
-    x = max(2, min((rect.left + rect.right) // 2, client.right - 2))
-    y_candidates = (
-        min(client.bottom - 2, rect.bottom + 1),
-        min(client.bottom - 2, rect.bottom + row_height // 2),
-        max(2, rect.top + row_height + 1),
-        max(2, (rect.top + rect.bottom) // 2),
-    )
+    x = max(30, min(client.right // 2, client.right - 2))
 
     def matching_card_window():
         return next(
@@ -1444,51 +1494,81 @@ def _open_card_window(pid: int, retrieval: Any, pdf_number: str, timeout: float)
             None,
         )
 
-    for y in dict.fromkeys(y_candidates):
-        result_list.double_click_input(coords=(x, int(y)))
-        card_window = _wait_for(matching_card_window, min(timeout, 4.0), interval=0.2)
-        if card_window:
-            return card_window
-
-        # Close a wrong row if the coordinate probe opened the neighbouring
-        # card, then try the next calibrated point.
+    def close_wrong_card_windows() -> None:
         for window in _windows(pid):
             title = _title(window)
             if title.startswith("PDF#") and pdf_number not in title:
                 _post_close(window)
         time.sleep(0.2)
 
-    # Fallback for environments where pywinauto input is unavailable.
-    lparam = ((int(y_candidates[0]) & 0xFFFF) << 16) | (x & 0xFFFF)
-    for message, modifier in (
-        (win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON),
-        (win32con.WM_LBUTTONUP, 0),
-        (win32con.WM_LBUTTONDBLCLK, win32con.MK_LBUTTON),
-        (win32con.WM_LBUTTONUP, 0),
-    ):
-        win32gui.SendMessage(result_list.handle, message, modifier, lparam)
-        time.sleep(0.05)
-    card_window = _wait_for(
-        matching_card_window,
-        timeout,
-        interval=0.3,
-    )
-    if not card_window:
-        raise RuntimeError(f"卡片 {pdf_number} 没有打开。")
-    return card_window
+    if result_list.item_count() == 1 and target_index == 0:
+        single_y = (rect.top + rect.bottom) // 2
+        result_list.double_click_input(coords=(x, int(single_y)))
+        card_window = _wait_for(matching_card_window, min(timeout, 6.0), interval=0.2)
+        if card_window:
+            return card_window
+        close_wrong_card_windows()
+
+    try:
+        retrieval.set_focus()
+        result_list.set_focus()
+        time.sleep(0.15)
+    except Exception:
+        pass
+
+    # Scan visible row centres downward from the report viewport. This avoids
+    # hard-coding Jade's header/scroll offsets, which differ with DPI and state.
+    first_y = max(row_height, client.bottom - row_height - 1)
+    scan_count = max(1, min(result_list.item_count(), 32))
+    probe_diagnostics: list[str] = []
+    target_item = result_list.item(target_index)
+    try:
+        target_item.deselect()
+    except Exception:
+        pass
+    for step in range(scan_count):
+        probe_y = first_y - step * row_height
+        if probe_y <= client.top:
+            break
+        result_list.click_input(coords=(x, int(probe_y)))
+        time.sleep(0.12)
+        target_selected = target_item.is_selected()
+        probe_diagnostics.append(f"y={probe_y}, target_selected={target_selected}")
+        if not target_selected:
+            continue
+        result_list.double_click_input(coords=(x, int(probe_y)))
+        card_window = _wait_for(matching_card_window, min(timeout, 4.0), interval=0.2)
+        if card_window:
+            return card_window
+        close_wrong_card_windows()
+
+    detail = "；".join(probe_diagnostics[-8:])
+    raise RuntimeError(f"卡片 {pdf_number} 没有打开（{detail}）。")
 
 
 def _parse_card_text(raw: str, pdf_number: str) -> dict[str, Any]:
     lines = raw.splitlines()
     peaks: list[dict[str, Any]] = []
 
-    def parse_chunk(chunk: str) -> dict[str, Any] | None:
+    def parse_chunk(chunk: str, require_hkl: bool = False) -> dict[str, Any] | None:
         if len(chunk) < 10:
             return None
         d_text = chunk[0:7].strip()
         intensity_text = re.sub(r"[^0-9.]", "", chunk[7:10])
         hkl = re.sub(r"[^0-9\-\s]", " ", chunk[10:23])
         hkl = re.sub(r"\s+", " ", hkl).strip()
+        hkl_tokens = hkl.split()
+        valid_hkl = (
+            len(hkl_tokens) == 3
+            and all(
+                re.fullmatch(r"-?\d{1,2}", token) and abs(int(token)) <= 20
+                for token in hkl_tokens
+            )
+        )
+        if hkl and not valid_hkl:
+            return None
+        if require_hkl and not valid_hkl:
+            return None
         if not d_text or not intensity_text:
             return None
         try:
@@ -1509,27 +1589,36 @@ def _parse_card_text(raw: str, pdf_number: str) -> dict[str, Any]:
     for line in lines:
         marker = CARD_MARKER_RE.search(line)
         compact = COMPACT_CARD_MARKER_RE.search(line)
-        if marker and marker.group("line").endswith("I"):
+        if marker:
             prefix = line[: marker.start("marker")]
             for offset in (0, 23, 46):
-                peak = parse_chunk(prefix[offset : offset + 23])
+                peak = parse_chunk(
+                    prefix[offset : offset + 23],
+                    require_hkl=not marker.group("line").endswith("I"),
+                )
                 if peak:
                     peaks.append(peak)
-        elif compact and compact.group("marker").endswith("I"):
+        elif compact:
             prefix = line[: compact.start("marker")]
             if prefix and prefix[-1].isdigit():
                 prefix = prefix[:-1]
             for offset in range(0, len(prefix), 23):
-                peak = parse_chunk(prefix[offset : offset + 23])
+                peak = parse_chunk(
+                    prefix[offset : offset + 23],
+                    require_hkl=not compact.group("marker").endswith("I"),
+                )
                 if peak:
                     peaks.append(peak)
 
     def first_text_for(marker_suffix: str) -> str:
         for line in lines:
-            match = re.search(r"P[0-9A-Z]{6}" + marker_suffix + r"\s*$", line)
+            match = CARD_MARKER_RE.search(line)
             if not match:
                 continue
-            text = line[: match.start()].strip()
+            actual_suffix = match.group("line")
+            if actual_suffix[-1] != marker_suffix[-1]:
+                continue
+            text = line[: match.start("marker")].strip()
             if text:
                 return re.sub(r"\s+", " ", text)
         return ""
@@ -1554,6 +1643,8 @@ def _parse_card_text(raw: str, pdf_number: str) -> dict[str, Any]:
                 compact_formula = re.sub(r"\s+", "", text)
         phase = phase or compact_phase
         formula = formula or compact_formula
+    phase = re.sub(r"\s+[A-Z]\s*\d+\s*$", "", phase).strip()
+    formula = re.sub(r"\s+", "", formula)
     return {
         "pdf_number": pdf_number,
         "phase": phase or f"PDF {pdf_number}",
@@ -1601,15 +1692,25 @@ def _open_pdf_retrieval_window(pid: int, main: Any, timeout: float) -> Any:
             _send_menu_command(main, 163)  # PDF -> Retrieval...
         except Exception as exc:
             errors.append(str(exc))
+        retrieval = _wait_for(
+            lambda: _find_window(pid, "PDF Retrievals"),
+            min(timeout, 3.0),
+            interval=0.25,
+        )
+        if not retrieval:
+            # WM_COMMAND works most of the time, but a fresh Jade launch may
+            # ignore it until the data window is fully active. Fall back to
+            # the accessible menu command even when PostMessage itself
+            # succeeds.
             try:
                 _invoke_uia_menu(pid, 163, timeout)
             except Exception as fallback_exc:
                 errors.append(str(fallback_exc))
-        retrieval = _wait_for(
-            lambda: _find_window(pid, "PDF Retrievals"),
-            min(timeout, 8.0),
-            interval=0.25,
-        )
+            retrieval = _wait_for(
+                lambda: _find_window(pid, "PDF Retrievals"),
+                min(timeout, 8.0),
+                interval=0.25,
+            )
         if retrieval:
             return retrieval
         _dismiss_error_windows(pid)
@@ -1685,18 +1786,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_search(args: argparse.Namespace) -> int:
     jade_exe = Path(args.jade).expanduser().resolve()
     timeout = float(args.timeout)
-    elements = _parse_elements(args.elements, args.formula)
-    if not elements:
-        raise SystemExit(
-            "Jade 检索前必须提供元素和化学式。请先向用户询问元素与化学式；"
-            "若用户没有，先获取样品信息或研究方向，再查论文和公开资料归纳"
-            "该方向的常规元素与化学式。"
-        )
-    if not args.formula:
-        raise SystemExit(
-            "缺少化学式。请先向用户询问；若用户没有，先获取样品信息或"
-            "研究方向后再归纳常规物相。"
-        )
+    unfiltered = bool(args.unfiltered)
+    if unfiltered:
+        elements: list[str] = []
+        formula = args.formula or "unfiltered Search/Match"
+    else:
+        elements = _parse_elements(args.elements, args.formula)
+        formula = args.formula
+        if not elements:
+            raise SystemExit(
+                "限定元素检索需要 --elements 和 --formula。"
+                "元素未知时请加 --unfiltered 先做无条件 Search/Match。"
+            )
+        if not formula:
+            raise SystemExit(
+                "缺少 --formula。元素未知时请使用 --unfiltered。"
+            )
 
     pid, main = _start_or_find_jade(jade_exe, timeout)
     if args.pattern and not args.no_load:
@@ -1712,22 +1817,32 @@ def cmd_search(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     backup = _backup_chemistry_filter()
     try:
-        _set_chemistry_filter(
+        if not unfiltered:
+            _set_chemistry_filter(
+                pid,
+                main,
+                elements,
+                timeout,
+                filter_mode=args.filter_mode,
+            )
+        _run_search_match(
             pid,
-            main,
-            elements,
+            data_window,
             timeout,
-            filter_mode=args.filter_mode,
+            use_chemistry_filter=not unfiltered,
         )
-        _run_search_match(pid, data_window, timeout)
         rows = _read_search_display(pid, timeout)
         metadata = {
             "sample": pattern_name,
             "elements": elements,
-            "formula": args.formula,
-            "filter_mode": args.filter_mode,
+            "formula": formula,
+            "filter_mode": "unfiltered" if unfiltered else args.filter_mode,
             "find_peaks": not args.reuse_peaks,
-            "note": "元素和化学式由用户提供或经研究背景确认后传入。",
+            "note": (
+                "未使用 chemistry filter；结果仅作为候选池。"
+                if unfiltered
+                else "元素和化学式由用户提供或经研究背景确认后传入。"
+            ),
         }
         _write_candidates(rows, out_dir, "Search/Match Display", metadata)
         (out_dir / "search_request.json").write_text(
@@ -1739,9 +1854,9 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     cards = _export_cards(pid, main, args.export_card, out_dir, timeout)
     print(f"样品：{pattern_name}")
-    print(f"元素约束：{', '.join(elements)}")
-    print(f"化学式：{args.formula}")
-    print(f"元素筛选模式：{args.filter_mode}")
+    print(f"元素约束：{', '.join(elements) if elements else '未限定'}")
+    print(f"化学式：{formula}")
+    print(f"元素筛选模式：{'unfiltered' if unfiltered else args.filter_mode}")
     print(f"候选卡片：{len(rows)} 条")
     for row in rows[:10]:
         fom = "?" if row["fom"] is None else f"{row['fom']:.1f}"
@@ -1791,13 +1906,18 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--out", required=True, help="输出目录")
     search.add_argument(
         "--elements",
-        required=True,
+        default="",
         help='用户确认的目标元素，例如 "Si,Fe,Cu,S"',
     )
     search.add_argument(
         "--formula",
-        required=True,
+        default="",
         help='目标物相或化学式，例如 "Si + FeS2 + CuFeS2"',
+    )
+    search.add_argument(
+        "--unfiltered",
+        action="store_true",
+        help="元素未知时先做无条件 Search/Match；结果只作为候选池",
     )
     search.add_argument(
         "--filter-mode",

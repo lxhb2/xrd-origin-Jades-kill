@@ -19,6 +19,7 @@ Thumbs.db
 *.tmp
 
 demo/
+.tmp_demo_*/
 xrd_out/
 jade_out/
 origin_out/

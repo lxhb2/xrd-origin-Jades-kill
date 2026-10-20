@@ -1,6 +1,7 @@
 # Plot generation
 matplotlib>=3.8
 Pillow>=10.0
+scipy>=1.11
 
 # Jade 6.5 GUI automation on Windows
 pywinauto>=0.6.8

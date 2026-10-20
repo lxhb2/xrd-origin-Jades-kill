@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 DEFAULT_COLORS = ["#1F4E79", "#C1543A", "#222222", "#7A5EA8", "#C9A227", "#2F8F9D"]
 DEFAULT_CARD_COLORS = ["#8E6BBE", "#4FA65A", "#F0A35E", "#4C9DB8", "#B07AA1", "#7B8B3A"]
 ORIGIN_MARKER_KINDS = [1, 4, 2, 3, 5, 6]
@@ -120,8 +120,8 @@ def _card_baselines(
     if not sample_offsets:
         start = 0.0
     else:
-        start = min(sample_offsets) - 0.52 * (1.0 + gap)
-    step = max(0.38, row_height)
+        start = min(sample_offsets) - 0.56 * (1.0 + gap)
+    step = max(0.34, row_height)
     return [start - index * step for index in range(card_count)]
 
 
@@ -154,9 +154,11 @@ def _build_graph(args: argparse.Namespace) -> dict[str, Any]:
     single_sample = bool(layout.get("single_sample", False))
     hide_card_sticks = single_sample and peak_marking in {"markers", "hkl"}
     if args.card_row_height is None:
-        args.card_row_height = float(layout.get("card_row_height", 0.72))
+        args.card_row_height = float(layout.get("card_row_height", 0.40))
     if args.stick_height is None:
-        args.stick_height = float(layout.get("stick_height", 0.78))
+        args.stick_height = float(layout.get("stick_height", 0.58))
+    if args.card_min_intensity is None:
+        args.card_min_intensity = float(layout.get("card_min_intensity", 5.0))
     offsets = [float(value) for value in manifest.get("offsets", [])]
     if len(offsets) != len(samples):
         gap = float(manifest.get("gap", 0.75))
@@ -194,6 +196,8 @@ def _build_graph(args: argparse.Namespace) -> dict[str, Any]:
             y_sticks: list[float] = []
             base = card_bases[index]
             for x_value, intensity in zip(xs, ys):
+                if intensity < args.card_min_intensity:
+                    continue
                 height = (
                     args.card_row_height
                     * args.stick_height
@@ -241,13 +245,13 @@ def _build_graph(args: argparse.Namespace) -> dict[str, Any]:
                 DEFAULT_COLORS[index % len(DEFAULT_COLORS)],
             )
     if args.card_labels and not hide_card_sticks:
-        label_x = x_max + 0.018 * (x_max - x_min)
+        label_x = x_min + 0.73 * (x_max - x_min)
         for index, item in enumerate(card_metadata):
             _add_graph_label(
                 layer,
                 item["label"],
                 label_x,
-                card_bases[index] + 0.45 * args.stick_height * args.card_row_height,
+                card_bases[index] + 0.64 * args.stick_height * args.card_row_height,
                 DEFAULT_CARD_COLORS[index % len(DEFAULT_CARD_COLORS)],
             )
 
@@ -342,6 +346,7 @@ def _build_graph(args: argparse.Namespace) -> dict[str, Any]:
             "card_position": "bottom",
             "card_row_height": args.card_row_height,
             "stick_height": args.stick_height,
+            "card_min_intensity": args.card_min_intensity,
         },
         "outputs": {
             "opju": str(opju_path),
@@ -370,6 +375,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="卡片分层行高；默认沿用 xrd_stack.py 的 manifest")
     parser.add_argument("--stick-height", type=float, default=None,
                         help="卡片竖线占卡片行高的比例；默认沿用 manifest")
+    parser.add_argument("--card-min-intensity", type=float, default=None,
+                        help="只显示相对强度不低于该值的卡片棒线；默认沿用 manifest")
     parser.add_argument("--card-labels", action="store_true", default=True,
                         help="显示卡片名称（默认显示）")
     parser.add_argument("--no-card-labels", dest="card_labels", action="store_false")

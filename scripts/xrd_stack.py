@@ -18,8 +18,8 @@
   # 只解析 PDF 卡片、不出图（不需要 matplotlib）
   python xrd_stack.py --card "beta-PbO2=jade/pbo2.txt" --cards-only --out ./cards
 
-科学边界：本脚本只做"读取 - 归一化 - 排版"，不扣背景、不平滑、不检索物相、
-不判断峰归属。卡片峰位与 λ 都会写进 manifest.json，便于复核与写进论文实验部分。
+科学边界：本脚本只做"读取 - 可选平滑 - 归一化 - 排版"，不扣背景、不检索物相、
+不判断峰归属。平滑参数、卡片峰位与 λ 都会写进 manifest.json，便于复核与写进论文实验部分。
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 
 
 def _configure_console() -> None:
@@ -589,6 +589,37 @@ def normalize(values: list[float], mode: str) -> list[float]:
     return [v / peak for v in values]
 
 
+def smooth_intensity(
+    values: list[float],
+    mode: str,
+    window_length: int,
+    polyorder: int,
+    warnings: list[str],
+) -> list[float]:
+    """Return plot-only smoothing; exported Origin tables keep the raw intensity."""
+    if mode == "none" or len(values) < 5:
+        return list(values)
+
+    window = max(polyorder + 2, int(window_length))
+    if window % 2 == 0:
+        window += 1
+    max_window = len(values) if len(values) % 2 else len(values) - 1
+    window = min(window, max_window)
+    if window <= polyorder:
+        warnings.append("谱线过短，已跳过 Savitzky-Golay 平滑")
+        return list(values)
+
+    try:
+        from scipy.signal import savgol_filter
+    except ImportError:
+        warnings.append("未安装 scipy，已跳过 Savitzky-Golay 平滑；原始谱线仍正常输出")
+        return list(values)
+
+    return savgol_filter(
+        values, window_length=window, polyorder=polyorder, mode="interp"
+    ).tolist()
+
+
 def detect_observed_peaks(
     two_theta: list[float],
     intensity: list[float],
@@ -782,19 +813,32 @@ def write_peak_annotations(out_dir: Path, annotations: list[dict]) -> str | None
 # --------------------------------------------------------------------------- #
 # 绘图
 # --------------------------------------------------------------------------- #
-def pick_font(requested: str | None, need_cjk: bool) -> str | None:
+def pick_fonts(requested: str | None, need_cjk: bool) -> list[str]:
     try:
         from matplotlib import font_manager
     except Exception:  # pragma: no cover - matplotlib 缺失时由调用方处理
-        return requested
+        return [requested] if requested else []
     available = {f.name for f in font_manager.fontManager.ttflist}
-    if requested:
-        return requested if requested in available else None
+    families: list[str] = []
+    if requested and requested in available:
+        families.append(requested)
+    elif not requested:
+        for name in ("Times New Roman", "Arial", "DejaVu Sans"):
+            if name in available:
+                families.append(name)
+                break
     if need_cjk:
         for name in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Source Han Sans SC", "SimSun"):
             if name in available:
-                return name
-    return "Arial" if "Arial" in available else "DejaVu Sans"
+                if name not in families:
+                    families.append(name)
+                break
+    if not families:
+        for name in ("DejaVu Sans", "Arial"):
+            if name in available:
+                families.append(name)
+                break
+    return families or ["DejaVu Sans"]
 
 
 def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[float],
@@ -806,12 +850,13 @@ def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[floa
     from matplotlib.ticker import MultipleLocator
 
     labels = [s["name"] for s in samples] + [c["name"] for c in cards] + [args.title or ""]
-    font = pick_font(args.font, need_cjk=any(CJK_RE.search(x) for x in labels))
-    if font:
-        plt.rcParams["font.family"] = font
-        plt.rcParams["font.sans-serif"] = [font] + list(plt.rcParams.get("font.sans-serif", []))
-    else:
-        warnings.append(f"未找到指定字体 {args.font}，已回退到 matplotlib 默认字体（中文可能显示为方框）")
+    fonts = pick_fonts(args.font, need_cjk=any(CJK_RE.search(x) for x in labels))
+    if args.font and args.font not in fonts:
+        warnings.append(f"未找到指定字体 {args.font}，已回退到 {', '.join(fonts)}")
+    plt.rcParams["font.family"] = fonts
+    plt.rcParams["font.serif"] = fonts
+    plt.rcParams["font.sans-serif"] = fonts
+    plt.rcParams["mathtext.fontset"] = "stix"
     plt.rcParams["axes.unicode_minus"] = False
     plt.rcParams["mathtext.default"] = "regular"
 
@@ -822,7 +867,14 @@ def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[floa
 
     fig, ax = plt.subplots(figsize=(args.width, args.height), dpi=100)
     for idx, sample in enumerate(samples):
-        y = [offsets[idx] + v for v in normalize(sample["intensity"], args.norm)]
+        plotted_intensity = smooth_intensity(
+            sample["intensity"],
+            args.smooth,
+            args.smooth_window,
+            args.smooth_polyorder,
+            warnings,
+        )
+        y = [offsets[idx] + v for v in normalize(plotted_intensity, args.norm)]
         color = args.colors[idx % len(args.colors)]
         ax.plot(sample["two_theta"], y, color=color, lw=sample_line_width,
                 solid_joinstyle="round", label=sample["name"], zorder=3)
@@ -880,16 +932,17 @@ def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[floa
             color = args.card_colors[idx % len(args.card_colors)]
             bands.append((idx, top - card_band, top, top - card_band, color))
     elif not annotated_single:
-        row_height = max(0.38, args.card_row_height)
-        first_baseline = min(offsets) - 0.52 * sample_step
+        row_height = max(0.34, args.card_row_height)
+        first_baseline = min(offsets) - 0.56 * sample_step
         for idx in range(len(cards)):
             baseline = first_baseline - idx * row_height
-            top = baseline + max(0.16, args.stick_height) * row_height
+            top = baseline + max(0.30, args.stick_height) * row_height
             color = args.card_colors[idx % len(args.card_colors)]
             bands.append((idx, baseline, top, baseline, color))
 
     if not per_sample_mode and cards and bands:
-        divider = max(top for _, _, top, _, _ in bands) + 0.06 * args.card_row_height
+        row_height = max(0.34, args.card_row_height)
+        divider = max(baseline for _, _, _, baseline, _ in bands) + row_height + 0.03
         ax.hlines(
             divider, x_left, x_right, colors="#9A9A9A",
             linewidth=0.55, zorder=1, clip_on=False,
@@ -898,8 +951,16 @@ def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[floa
     for idx, bottom, top, baseline, color in bands:
         card = cards[idx]
         height_band = max(top - bottom, 1e-9)
-        tops = [bottom + h / 100.0 * height_band for h in card["intensity_rel100"]]
-        ax.vlines(card["two_theta"], bottom, tops, color=color, lw=args.stick_width,
+        visible_index = [
+            idx for idx, intensity in enumerate(card["intensity_rel100"])
+            if intensity >= args.card_min_intensity
+        ]
+        visible_x = [card["two_theta"][idx] for idx in visible_index]
+        visible_tops = [
+            bottom + card["intensity_rel100"][idx] / 100.0 * height_band
+            for idx in visible_index
+        ]
+        ax.vlines(visible_x, bottom, visible_tops, color=color, lw=args.stick_width,
                   alpha=0.95, zorder=2)
         ax.hlines(
             baseline, x_left, x_right, colors="#6F6F6F",
@@ -907,11 +968,12 @@ def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[floa
         )
         if args.card_labels:
             ax.text(
-                1.018, 0.5 * (bottom + top), format_chemical_formula(card_display_label(card)),
-                transform=ax.get_yaxis_transform(),
-                ha="left", va="center", fontsize=args.card_label_size, color=color,
-                fontstyle="italic",
-                clip_on=False, zorder=4,
+                x_right - 0.012 * x_span,
+                top + 0.045 * max(top - bottom, 1e-9),
+                format_chemical_formula(card_display_label(card)),
+                ha="right", va="bottom", fontsize=args.card_label_size, color=color,
+                fontweight="bold",
+                clip_on=True, zorder=4,
             )
 
     if args.sample_labels and not single_sample:
@@ -935,10 +997,11 @@ def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[floa
     ax.set_ylim(y_bottom, y_top)
 
     ax.xaxis.set_major_locator(MultipleLocator(args.x_tick))
-    ax.set_xlabel(args.xlabel, fontsize=10.5)
-    ax.set_ylabel(args.ylabel, fontsize=10.5)
+    ax.set_xlabel(args.xlabel, fontsize=11.5)
+    ax.set_ylabel(args.ylabel, fontsize=11.5)
     ax.set_yticks([])
-    ax.tick_params(axis="x", which="both", direction="in", top=True, labelsize=9.5)
+    ax.tick_params(axis="x", which="both", direction="in", top=False, bottom=True,
+                   labelsize=10.5)
     ax.tick_params(axis="y", which="both", direction="in", right=True)
     for spine in ax.spines.values():
         spine.set_linewidth(0.9)
@@ -949,7 +1012,8 @@ def make_figure(args, samples: list[dict], cards: list[dict], offsets: list[floa
         elif args.peak_marking == "hkl":
             legend_mode = "none"
         else:
-            legend_mode = "inside" if single_sample else "none"
+            # 默认分层卡片已经在框内逐行标注，不再重复放大图例。
+            legend_mode = "none"
     if legend_mode == "above":
         ax.legend(
             loc="lower left", bbox_to_anchor=(0.0, 1.01), ncol=min(max(len(samples), 1), 4),
@@ -1073,6 +1137,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--norm", default="max1", choices=["max1", "max100", "none"],
                    help="每条谱线的归一化方式（默认 max1）")
+    p.add_argument("--smooth", default="savgol", choices=["none", "savgol"],
+                   help="谱线显示平滑：默认 savgol；原始强度表不改动")
+    p.add_argument("--smooth-window", type=int, default=11,
+                   help="Savitzky-Golay 窗口点数（默认 11，自动为奇数）")
+    p.add_argument("--smooth-polyorder", type=int, default=3,
+                   help="Savitzky-Golay 多项式阶数（默认 3）")
     p.add_argument("--sample-cols", default=None, metavar="i,j",
                    help="样品文件里 2θ 与强度所在的列号（1 基）")
     p.add_argument("--card-cols", default=None, metavar="i,j",
@@ -1081,14 +1151,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="卡片第一列的含义（默认自动判断）")
 
     p.add_argument("--gap", type=float, default=0.75, help="曲线间距（相对谱线高度，默认 0.75）")
-    p.add_argument("--stick-height", type=float, default=0.78,
-                   help="卡片竖线占卡片行高的比例（默认 0.78）")
+    p.add_argument("--stick-height", type=float, default=0.58,
+                   help="卡片竖线占卡片行高的比例（默认 0.58）")
     p.add_argument("--stick-width", type=float, default=0.85, help="卡片竖线线宽（默认 0.85）")
-    p.add_argument("--card-row-height", type=float, default=0.72,
-                   help="下方卡片的分层行高（默认 0.72）")
+    p.add_argument("--card-row-height", type=float, default=0.40,
+                   help="下方卡片的分层行高（默认 0.40，较紧凑）")
+    p.add_argument("--card-min-intensity", type=float, default=5.0,
+                   help="只显示相对强度不低于该值的卡片棒线；默认 5，原始卡表不变")
     p.add_argument("--card-position", default="bottom", choices=["per-sample", "bottom"],
                    help="卡片位置：贴在对应曲线下方，或统一放在最底部")
-    p.add_argument("--card-labels", action="store_true", default=True, help="显示卡片名称（默认显示）")
+    p.add_argument("--card-labels", action="store_true", default=True,
+                   help="在坐标框内显示卡片名称（默认显示）")
     p.add_argument("--no-card-labels", dest="card_labels", action="store_false",
                    help="不显示卡片名称")
     p.add_argument("--sample-labels", action="store_true", default=True,
@@ -1101,17 +1174,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="样品颜色列表，逗号分隔的 HEX 值")
     p.add_argument("--card-colors", default=",".join(DEFAULT_CARD_COLORS),
                    help="PDF 卡片颜色列表，逗号分隔的 HEX 值")
-    p.add_argument("--font", default=None, help="字体名（默认自动：含中文时用 Microsoft YaHei）")
+    p.add_argument("--font", default=None,
+                   help="首选英文字体（默认 Times New Roman，中文自动回退 Microsoft YaHei）")
     p.add_argument("--x-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
                    help="X 轴范围，例如 --x-range 10 80")
     p.add_argument("--x-tick", type=float, default=10.0, help="X 轴主刻度间隔（默认 10°）")
-    p.add_argument("--xlabel", default="2θ (°)", help="X 轴标题")
+    p.add_argument("--xlabel", default="2-Theta (°)", help="X 轴标题")
     p.add_argument("--ylabel", default="Intensity (a.u.)", help="Y 轴标题")
     p.add_argument("--title", default=None, help="图标题（默认不加）")
     p.add_argument("--legend", default="auto", choices=["auto", "above", "inside", "none"],
-                   help="样品图例：自动（单谱右上、堆叠不重复）、上方、图框内、或不显示")
-    p.add_argument("--card-label-size", type=float, default=7.5, help="卡片名称字号")
-    p.add_argument("--sample-label-size", type=float, default=8.2, help="样品名称字号")
+                   help="图例：auto（分层卡片不重复图例）、上方、图框内、或不显示")
+    p.add_argument("--card-label-size", type=float, default=8.5, help="卡片名称字号")
+    p.add_argument("--sample-label-size", type=float, default=9.0, help="样品名称字号")
     p.add_argument(
         "--peak-marking",
         default="none",
@@ -1171,6 +1245,14 @@ def parse_col_arg(value: str | None, label: str) -> tuple[int, int] | None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     warnings: list[str] = []
+
+    if args.smooth_polyorder < 1:
+        raise SystemExit("--smooth-polyorder 必须至少为 1")
+    if args.smooth_window <= args.smooth_polyorder:
+        raise SystemExit("--smooth-window 必须大于 --smooth-polyorder")
+    if args.smooth_window % 2 == 0:
+        args.smooth_window += 1
+        warnings.append(f"Savitzky-Golay 窗口自动调整为奇数 {args.smooth_window}")
 
     if args.wavelength:
         wavelength = args.wavelength
@@ -1270,10 +1352,17 @@ def main(argv: list[str] | None = None) -> int:
         "wavelength_angstrom": wavelength,
         "normalization": args.norm,
         "gap": args.gap,
+        "plot_processing": {
+            "smoothing": args.smooth,
+            "savgol_window": args.smooth_window,
+            "savgol_polyorder": args.smooth_polyorder,
+            "smoothing_scope": "display-only; Origin intensity tables remain raw",
+        },
         "layout": {
             "card_position": args.card_position,
             "card_row_height": args.card_row_height,
             "stick_height": args.stick_height,
+            "card_min_intensity": args.card_min_intensity,
             "single_sample": len(samples) == 1,
         },
         "peak_marking": {
@@ -1295,7 +1384,7 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "outputs": outputs,
         "warnings": warnings,
-        "note": "本脚本不扣背景、不平滑、不检索物相；卡片峰位与 λ 已记录，便于复现。",
+        "note": "本脚本不扣背景、不检索物相；显示平滑参数、卡片峰位与 λ 已记录，便于复现。",
     }
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

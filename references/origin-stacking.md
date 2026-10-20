@@ -23,9 +23,9 @@ python scripts/origin_stack.py --origin-dir ./figs/xrd/origin --out ./figs/xrd_o
 - `origin_run.json`：样品、卡片、偏移量和输出路径记录。
 
 卡片竖线由 Origin 的折线“分段连接”生成，每一对同 x 的上下点画成一条竖线，最后再补一对端点画该卡片层的水平基线；不要改回普通连续折线，否则峰间会出现错误的水平连线。
-卡片标签优先使用 `manifest.json` 或 `Sheet2_cards.csv` 里的化学式，放在主图右侧，不与棒状图区域重叠。
+卡片标签优先使用 `manifest.json` 或 `Sheet2_cards.csv` 里的化学式，放在主图右侧的框内标签区，不与棒状图区域重叠。默认层距 `0.40`、棒高 `0.58`，只显示相对强度不低于 `5%` 的卡片棒线；过滤只影响图形，数据表仍保留全部卡片峰。
 
-若 `xrd_stack.py` 使用了 `--peak-marking markers`，Origin 脚本会读取 `Sheet3_peak_annotations.csv`，为每张卡片建立可编辑的散点标峰图层；若使用 `--peak-marking hkl`，则把 `(hkl)` 文本放到对应实测峰上。两种标峰都只适用于单条 XRD 谱；启用后 Origin 脚本会跳过 `PDF_Cards` 工作表和卡片棒状图图层，也不再添加卡片右侧标签。多样品堆叠图不使用单谱标峰，仍会保留下方卡片棒状图层。
+若 `xrd_stack.py` 使用了 `--peak-marking markers`，Origin 脚本会读取 `Sheet3_peak_annotations.csv`，为每张卡片建立可编辑的散点标峰图层；若使用 `--peak-marking hkl`，则把 `(hkl)` 文本放到对应实测峰上。两种标峰都只适用于单条 XRD 谱；启用后 Origin 脚本会跳过 `PDF_Cards` 工作表和卡片棒状图图层，也不再添加卡片标签。多样品堆叠图不使用单谱标峰，仍会保留下方卡片棒状图层；卡片标签和棒线应保持在同一坐标框内。
 
 运行前保存并关闭已有的 Origin 工程；若确认要复用当前进程，显式加 `--allow-existing`。如果导出的 PNG 出现重复 `demo` 水印，检查 Origin 是否已激活；这是本机许可证状态，不是脚本加入的标签。
 
@@ -56,7 +56,7 @@ python scripts/origin_stack.py --origin-dir ./figs/xrd/origin --out ./figs/xrd_o
 6. **美化**：
    - 线宽：双击曲线 → `线条` → 宽度（论文常见 1.5–2.0）；
    - 坐标轴：X 轴范围覆盖全部主峰（常用 10°–80°），刻度线朝内，主刻度 10°；
-   - 图框：保留完整闭合边框，不要只留两条轴线；
+   - 图框：保留完整闭合边框，不要只留两条轴线；上边框不显示刻度线，X 刻度只从下边框朝内；
    - 纵轴：只留 `Intensity (a.u.)`，隐藏 Y 刻度数字，不标绝对强度。
 
 ## 做法二：卡片竖线（复制小图法）
@@ -87,7 +87,8 @@ python scripts/origin_stack.py --origin-dir ./figs/xrd/origin --out ./figs/xrd_o
 | 复制进去的图变形 | 用了对角线拉伸；改为只做水平/垂直拉伸 |
 | 竖线朝下（倒挂） | 卡片图 Y 轴被设为反向：双击 Y 轴 → 刻度 → 取消“反向” |
 | 数据列太多太乱 | Ctrl+左键多选无关列删除；2θ 列右键 → 设为 X |
-| 中文显示为方框 | 脚本出图用 `--font "Microsoft YaHei"`；Origin 里改轴标题字体 |
+| 中文显示为方框 | 脚本默认以 Times New Roman 显示英文、中文字体自动回退；若系统缺少中文字体，显式用 `--font "Microsoft YaHei"` |
+| 卡片棒线太密或名称贴层顶 | 提高 `--card-min-intensity` 过滤显示弱棒，降低 `--stick-height`，并保持 `--card-row-height` 在 `0.34–0.40`；标签下移到棒线上方即可 |
 
 ## 导出
 
